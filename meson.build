@@ -51,6 +51,7 @@ endif
 sources = [
     'src/av1.c',
     'src/backend-common.c',
+    'src/encode.c',
     'src/export-buf.c',
     'src/direct/direct-export-buf.c',
     'src/direct/nv-driver.c',

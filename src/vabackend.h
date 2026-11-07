@@ -52,10 +52,14 @@ typedef struct
     VABufferType    bufferType;
     void            *ptr;
     size_t          offset;
+    //For VAEncCodedBufferType buffers: usable bytes behind the embedded
+    //VACodedBufferSegment's data pointer, grown by the encoder as needed.
+    size_t          capacity;
 } NVBuffer;
 
 struct _NVContext;
 struct _BackingImage;
+struct _NVEncodeLib;
 
 typedef struct
 {
@@ -171,6 +175,8 @@ typedef struct _NVDriver
 {
     CudaFunctions           *cu;
     CuvidFunctions          *cv;
+    //NVENC encode support (src/encode.c); NULL when libnvidia-encode is absent.
+    struct _NVEncodeLib     *encode;
     CUcontext               cudaContext;
     CUvideoctxlock          vidLock;
     Array/*<Object>*/       objects;
@@ -224,6 +230,12 @@ typedef struct _NVDriver
 } NVDriver;
 
 struct _NVCodec;
+
+typedef struct _NVCodec NVCodec;
+//NVENC-backed encoder owned by an encode VA context (src/encode.c).
+typedef struct _NVEncoder NVEncoder;
+//Per-driver NVENC library handle + capability cache (src/encode.c).
+typedef struct _NVEncodeLib NVEncodeLib;
 
 typedef struct _NVContext
 {
@@ -286,6 +298,10 @@ typedef struct _NVContext
     pthread_mutex_t     surfaceCreationMutex;
     int                 surfaceCount;
     bool                firstKeyframeValid;
+    //Encode contexts (VAEntrypointEncSlice): NVENC wrapper and the config's
+    //rate control mode.
+    NVEncoder           *encoder;
+    uint32_t            rcMode;
 } NVContext;
 
 typedef struct
@@ -296,6 +312,8 @@ typedef struct
     cudaVideoChromaFormat   chromaFormat;
     int                     bitDepth;
     cudaVideoCodec          cudaCodec;
+    //Encode contexts: the rate control mode the config was created with.
+    uint32_t                rcMode;
 } NVConfig;
 
 typedef void (*HandlerFunc)(NVContext*, NVBuffer* , CUVIDPICPARAMS*);
@@ -336,13 +354,14 @@ struct _NVCodec {
     void (*surfaceDestroyed)(NVContext*, VASurfaceID, NVSurface*);
 };
 
-typedef struct _NVCodec NVCodec;
-
 // Codec helpers. Surface lookup must stay under objectCreationMutex while the
 // returned pointer is used; buffer lookup has the same lifetime as RenderPicture.
 NVSurface *nvGetSurface(NVDriver *drv, VASurfaceID id);
 NVBuffer *nvGetBuffer(NVDriver *drv, VABufferID id);
 void nvSetSurfaceResolving(NVSurface *surface, bool resolving);
+//Block until any pending surface resolve (decode/VPP writeback) has finished,
+//so the backing image can be read.
+void nvSurfaceWaitResolved(NVSurface *surface);
 
 typedef struct
 {
