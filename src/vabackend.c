@@ -1089,7 +1089,8 @@ static VAStatus nvGetConfigAttributes(
         }
         for (int i = 0; i < num_attribs; i++) {
             if (!nvEncodeGetConfigAttribute(drv, profile, &attrib_list[i])) {
-                LOG("unhandled encode config attribute: %d", attrib_list[i].type);
+                LOG_DEBUG("unhandled encode config attribute: %d", attrib_list[i].type);
+                attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
             }
         }
         return VA_STATUS_SUCCESS;

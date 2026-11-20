@@ -42,13 +42,31 @@ enum EncParamKind {
 };
 
 //What an NVENC session needs to be (re)created with.
+//Fields up to rcMode need a full encoder re-init when they change; the rate
+//control fields after it are applied with nvEncReconfigureEncoder.
 typedef struct {
     uint32_t width, height;
     NV_ENC_BUFFER_FORMAT format;
-    uint32_t gopSize, bitRate, fpsNum, fpsDen, quality;
-    int rcMode, qp;
+    uint32_t gopSize, quality;
+    int rcMode;
+
+    uint32_t bitRate;           //VA bits_per_second: the peak rate for VBR
+    uint32_t targetPct;         //VA target_percentage of bitRate (VBR)
+    uint32_t fpsNum, fpsDen;
+    uint32_t vbvSize, vbvInit;  //HRD, in bits
+    int qp, minQp, maxQp;
     bool valid;
 } EncSetup;
+
+//Rate control state from misc parameter buffers. Clients only resend these
+//when something changes, so they persist across pictures.
+typedef struct {
+    uint32_t fpsNum, fpsDen;
+    uint32_t bitRate, targetPct;
+    uint32_t quality;
+    uint32_t vbvSize, vbvInit;
+    int qp, minQp, maxQp;
+} EncMiscState;
 
 struct _NVEncodeLib {
     void *handle;
@@ -73,17 +91,14 @@ struct _NVEncoder {
     void *session;              //NVENC encoder handle
     bool encoderReady;          //nvEncInitializeEncoder succeeded
     NV_ENC_CONFIG encodeConfig;
+    NV_ENC_INITIALIZE_PARAMS initParams;
 
-    //Input staging: NVENC-owned input buffer. Registering our own pitched
-    //CUDADEVICEPTR made NVENC mis-derive the NV12 plane geometry (frames come
-    //out vertically squashed on this driver line), so we let NVENC allocate
-    //and describe the input, the way FFmpeg's nvenc wrapper does. The surface
-    //planes are read back into hostStage (packed layout) and copied into the
-    //locked input buffer honouring NVENC's reported pitch.
-    NV_ENC_INPUT_PTR inputBuffer;
-    unsigned char *hostStage;
-    size_t hostStageSize;
-    uint32_t inputPitch;        //bytes per luma row, reported by NVENC
+    //Input: one pitched CUDA allocation holding the luma plane followed by
+    //the interleaved chroma plane at inputPitch * encHeight, registered with
+    //NVENC. Surfaces are copied into it device-to-device each picture.
+    CUdeviceptr inputDev;
+    size_t inputPitch;
+    NV_ENC_REGISTERED_PTR inputReg;
     NV_ENC_BUFFER_FORMAT bufferFormat;
     uint32_t encWidth, encHeight;   //size the encoder is initialised at
 
@@ -101,9 +116,7 @@ struct _NVEncoder {
     //later pictures in the same configuration.
     AppendableBuffer cachedSeq;
     bool haveCachedSeq;
-    uint32_t cachedFpsNum, cachedFpsDen, cachedQuality, cachedBitrate;
-    int cachedQp;
-    bool haveMiscCache;
+    EncMiscState misc;
 
     //Most recent VAEncCodedBufferType buffer created for this context, used
     //when the picture parameter doesn't name its output buffer.
@@ -161,11 +174,12 @@ bool nvEncodeDriverInit(NVDriver *drv) {
     }
 
     uint32_t maxVersion = 0;
-    //Both NVENCAPI_VERSION and NvEncodeAPIGetMaxSupportedVersion() pack major in
-    //the low byte and minor in bits 24-31, so they compare directly.
-    if (getMaxVersion(&maxVersion) != NV_ENC_SUCCESS || NVENCAPI_VERSION > maxVersion) {
-        LOG("Driver NVENC API version %d.%d too old for %d.%d, encoding will be unavailable",
-            (int) (maxVersion & 0xFF), (int) (maxVersion >> 24), NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
+    //NvEncodeAPIGetMaxSupportedVersion() returns (major << 4) | minor, which is
+    //a different packing from NVENCAPI_VERSION (major | minor << 24).
+    const uint32_t wantVersion = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
+    if (getMaxVersion(&maxVersion) != NV_ENC_SUCCESS || wantVersion > maxVersion) {
+        LOG("Driver NVENC API version %u.%u too old for %d.%d, encoding will be unavailable",
+            maxVersion >> 4, maxVersion & 0xF, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
         return false;
     }
 
@@ -427,7 +441,20 @@ NVEncoder *nvEncoderCreate(NVContext *ctx) {
     enc->drv = ctx->drv;
     enc->lib = ctx->drv->encode;
     enc->wanted.qp = -1;
+    enc->misc.qp = -1;
     return enc;
+}
+
+static void encoderFreeInput(NVEncoder *enc) {
+    if (enc->inputReg) {
+        enc->lib->api.nvEncUnregisterResource(enc->session, enc->inputReg);
+        enc->inputReg = NULL;
+    }
+    if (enc->inputDev) {
+        enc->drv->cu->cuMemFree(enc->inputDev);
+        enc->inputDev = 0;
+    }
+    enc->inputPitch = 0;
 }
 
 void nvEncoderDestroy(NVEncoder *enc) {
@@ -443,14 +470,12 @@ void nvEncoderDestroy(NVEncoder *enc) {
         for (int i = 0; i < ENC_PARAM_COUNT; i++) {
             freeAppendable(&enc->params[i]);
         }
+        freeAppendable(&enc->cachedSeq);
         free(enc);
         return;
     }
 
-    if (enc->inputBuffer) {
-        api->nvEncDestroyInputBuffer(enc->session, enc->inputBuffer);
-        enc->inputBuffer = NULL;
-    }
+    encoderFreeInput(enc);
     if (enc->bitstreamBuffer) {
         api->nvEncDestroyBitstreamBuffer(enc->session, enc->bitstreamBuffer);
         enc->bitstreamBuffer = NULL;
@@ -459,8 +484,6 @@ void nvEncoderDestroy(NVEncoder *enc) {
         api->nvEncDestroyEncoder(enc->session);
         enc->session = NULL;
     }
-    free(enc->hostStage);
-    enc->hostStage = NULL;
 
     drv->cu->cuCtxPopCurrent(NULL);
 
@@ -568,42 +591,51 @@ static void visitMisc(AppendableBuffer *ab, PictureParse *pp) {
         }
         misc = (const VAEncMiscParameterBuffer *) PTROFF(ab->buf, offset);
         offset += size;
-        EncSetup *setup = &pp->setup;
+        EncMiscState *state = &pp->enc->misc;
 
         switch ((int) misc->type) {
         case VAEncMiscParameterTypeFrameRate:
             if (size >= sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterFrameRate)) {
                 const VAEncMiscParameterFrameRate *fr = (const VAEncMiscParameterFrameRate *) misc->data;
-                setup->fpsNum = fr->framerate & 0xFFFF;
-                setup->fpsDen = fr->framerate >> 16;
-                if (setup->fpsDen == 0) {
-                    setup->fpsDen = 1;
+                //Low 16 bits numerator, high 16 bits denominator; a zero
+                //denominator means the whole value is an integer rate.
+                uint32_t num = fr->framerate & 0xFFFF;
+                uint32_t den = fr->framerate >> 16;
+                if (den == 0) {
+                    num = fr->framerate;
+                    den = 1;
                 }
-                pp->enc->cachedFpsNum = setup->fpsNum;
-                pp->enc->cachedFpsDen = setup->fpsDen;
-                pp->enc->haveMiscCache = true;
+                if (num) {
+                    state->fpsNum = num;
+                    state->fpsDen = den;
+                }
             }
             break;
         case VAEncMiscParameterTypeRateControl:
             if (size >= sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterRateControl)) {
                 const VAEncMiscParameterRateControl *rc = (const VAEncMiscParameterRateControl *) misc->data;
                 if (rc->bits_per_second) {
-                    setup->bitRate = rc->bits_per_second;
-                    pp->enc->cachedBitrate = rc->bits_per_second;
+                    state->bitRate = rc->bits_per_second;
+                    state->targetPct = rc->target_percentage;
                 }
                 if (rc->initial_qp) {
-                    setup->qp = (int) rc->initial_qp;
-                    pp->enc->cachedQp = (int) rc->initial_qp;
+                    state->qp = (int) rc->initial_qp;
                 }
-                pp->enc->haveMiscCache = true;
+                state->minQp = (int) rc->min_qp;
+                state->maxQp = (int) rc->max_qp;
+            }
+            break;
+        case VAEncMiscParameterTypeHRD:
+            if (size >= sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterHRD)) {
+                const VAEncMiscParameterHRD *hrd = (const VAEncMiscParameterHRD *) misc->data;
+                state->vbvSize = hrd->buffer_size;
+                state->vbvInit = hrd->initial_buffer_fullness;
             }
             break;
         case VAEncMiscParameterTypeQualityLevel:
             if (size >= sizeof(VAEncMiscParameterBuffer) + sizeof(VAEncMiscParameterBufferQualityLevel)) {
                 const VAEncMiscParameterBufferQualityLevel *q = (const VAEncMiscParameterBufferQualityLevel *) misc->data;
-                setup->quality = q->quality_level;
-                pp->enc->cachedQuality = q->quality_level;
-                pp->enc->haveMiscCache = true;
+                state->quality = q->quality_level;
             }
             break;
         default:
@@ -658,6 +690,18 @@ static bool setupFromH264(PictureParse *pp) {
 
     setup->width = (uint32_t) seq->picture_width_in_mbs * 16;
     setup->height = (uint32_t) seq->picture_height_in_mbs * 16;
+    if (seq->frame_cropping_flag) {
+        //4:2:0 crop units: 2 luma samples horizontally, 2 * (2 - frame_mbs_only)
+        //rows vertically. NVENC can only crop at the right/bottom edge, which
+        //is where clients put the alignment padding.
+        const uint32_t cropX = 2 * (seq->frame_crop_left_offset + seq->frame_crop_right_offset);
+        const uint32_t cropY = 2 * (2 - seq->seq_fields.bits.frame_mbs_only_flag) *
+                               (seq->frame_crop_top_offset + seq->frame_crop_bottom_offset);
+        if (cropX < setup->width && cropY < setup->height) {
+            setup->width -= cropX;
+            setup->height -= cropY;
+        }
+    }
     setup->gopSize = seq->intra_idr_period ? seq->intra_idr_period : seq->intra_period;
     if (setup->gopSize == 0 || setup->gopSize > NVENC_INFINITE_GOPLENGTH) {
         setup->gopSize = 250;
@@ -761,44 +805,51 @@ static bool parsePicture(NVEncoder *enc, PictureParse *pp) {
               pp->setup.width, pp->setup.height, pp->setup.gopSize,
               pp->setup.bitRate, pp->setup.qp, pp->keyFrame);
 
-    //Misc parameters can override seq-derived values. When this picture
-    //carries no misc buffers (mid-GOP), reuse the cached settings so the
-    //session configuration stays stable.
-    if (enc->params[ENC_PARAM_MISC].size == 0 && enc->haveMiscCache) {
-        if (enc->cachedFpsNum) {
-            pp->setup.fpsNum = enc->cachedFpsNum;
-            pp->setup.fpsDen = enc->cachedFpsDen;
-        }
-        if (enc->cachedBitrate) {
-            pp->setup.bitRate = enc->cachedBitrate;
-        }
-        pp->setup.quality = enc->cachedQuality;
-        if (enc->cachedQp > 0) {
-            pp->setup.qp = enc->cachedQp;
-        }
-    } else {
-        if (pp->setup.fpsNum == 0) {
-            pp->setup.fpsNum = 30;
-            pp->setup.fpsDen = 1;
-        }
-        visitMisc(&enc->params[ENC_PARAM_MISC], pp);
+    //Misc parameters override the seq-derived values and persist until the
+    //client sends new ones.
+    visitMisc(&enc->params[ENC_PARAM_MISC], pp);
+    const EncMiscState *misc = &enc->misc;
+    EncSetup *setup = &pp->setup;
+    setup->fpsNum = misc->fpsNum ? misc->fpsNum : 30;
+    setup->fpsDen = misc->fpsNum ? misc->fpsDen : 1;
+    if (misc->bitRate) {
+        setup->bitRate = misc->bitRate;
+        setup->targetPct = misc->targetPct;
     }
+    setup->quality = misc->quality;
+    if (misc->qp > 0) {
+        setup->qp = misc->qp;
+    }
+    setup->minQp = misc->minQp;
+    setup->maxQp = misc->maxQp;
+    setup->vbvSize = misc->vbvSize;
+    setup->vbvInit = misc->vbvInit;
 
-    pp->setup.valid = true;
+    setup->valid = true;
     return true;
 }
 
-static bool setupChanged(const EncSetup *a, const EncSetup *b) {
+//Changes that need a fresh encoder session.
+static bool setupNeedsReset(const EncSetup *a, const EncSetup *b) {
     return a->width != b->width ||
            a->height != b->height ||
            a->format != b->format ||
            a->gopSize != b->gopSize ||
-           a->bitRate != b->bitRate ||
+           a->quality != b->quality ||
+           a->rcMode != b->rcMode;
+}
+
+//Changes nvEncReconfigureEncoder can apply in place.
+static bool setupNeedsReconfigure(const EncSetup *a, const EncSetup *b) {
+    return a->bitRate != b->bitRate ||
+           a->targetPct != b->targetPct ||
            a->fpsNum != b->fpsNum ||
            a->fpsDen != b->fpsDen ||
-           a->quality != b->quality ||
-           a->rcMode != b->rcMode ||
-           a->qp != b->qp;
+           a->vbvSize != b->vbvSize ||
+           a->vbvInit != b->vbvInit ||
+           a->qp != b->qp ||
+           a->minQp != b->minQp ||
+           a->maxQp != b->maxQp;
 }
 
 // ---------------------------------------------------------------------------
@@ -830,27 +881,166 @@ static const GUID *presetForQuality(uint32_t quality) {
     return presets[quality - 1];
 }
 
-//Tear down the initialised encoder (keeping the session) so the next picture
+//Tear down the initialised encoder and session so the next picture
 //re-creates it with new settings.
 static void encoderReset(NVEncoder *enc) {
     NV_ENCODE_API_FUNCTION_LIST *api = &enc->lib->api;
-    if (enc->inputBuffer) {
-        api->nvEncDestroyInputBuffer(enc->session, enc->inputBuffer);
-        enc->inputBuffer = NULL;
-    }
+    encoderFreeInput(enc);
     if (enc->bitstreamBuffer) {
         api->nvEncDestroyBitstreamBuffer(enc->session, enc->bitstreamBuffer);
         enc->bitstreamBuffer = NULL;
     }
-    free(enc->hostStage);
-    enc->hostStage = NULL;
-    enc->hostStageSize = 0;
     if (enc->session) {
         api->nvEncDestroyEncoder(enc->session);
         enc->session = NULL;
     }
     enc->encoderReady = false;
     enc->haveCurrent = false;
+}
+
+static bool guidEqual(const GUID *a, const GUID *b) {
+    return memcmp(a, b, sizeof(GUID)) == 0;
+}
+
+//Fill enc->initParams and enc->encodeConfig for setup, starting from the
+//NVENC preset defaults. Needs an open session.
+static void encoderBuildParams(NVEncoder *enc, const EncSetup *setup, const EncodeProfileInfo *pInfo) {
+    NV_ENCODE_API_FUNCTION_LIST *api = &enc->lib->api;
+    const NV_ENC_PARAMS_RC_MODE rcMode = setup->bitRate || (setup->rcMode & VA_RC_CQP) ?
+        nvencRcMode(setup->rcMode) : NV_ENC_PARAMS_RC_VBR;
+    //CBR is what real-time clients (WebRTC) ask for; tune those for latency.
+    const NV_ENC_TUNING_INFO tuning = rcMode == NV_ENC_PARAMS_RC_CBR ?
+        NV_ENC_TUNING_INFO_LOW_LATENCY : NV_ENC_TUNING_INFO_HIGH_QUALITY;
+    const GUID *preset = presetForQuality(setup->quality);
+    const bool is10Bit = setup->format == NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+
+    NV_ENC_CONFIG *cfg = &enc->encodeConfig;
+    NV_ENC_PRESET_CONFIG presetConfig = {0};
+    presetConfig.version = NV_ENC_PRESET_CONFIG_VER;
+    presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
+    NVENCSTATUS status = api->nvEncGetEncodePresetConfigEx(enc->session, pInfo->codecGuid, *preset, tuning, &presetConfig);
+    if (status == NV_ENC_SUCCESS) {
+        *cfg = presetConfig.presetCfg;
+    } else {
+        nvEncodeLogError(enc->lib, enc->session, status, "NvEncGetEncodePresetConfigEx");
+        memset(cfg, 0, sizeof(*cfg));
+    }
+    cfg->version = NV_ENC_CONFIG_VER;
+    cfg->profileGUID = pInfo->profileGuid;
+    cfg->gopLength = setup->gopSize;
+    //No B-frames: output order matches input order, so there is never a
+    //reordering delay to flush and every picture yields one coded buffer.
+    cfg->frameIntervalP = 1;
+
+    NV_ENC_RC_PARAMS *rc = &cfg->rcParams;
+    rc->version = NV_ENC_RC_PARAMS_VER;
+    rc->rateControlMode = rcMode;
+    rc->lookaheadDepth = 0;
+    rc->enableLookahead = 0;
+    if (rcMode == NV_ENC_PARAMS_RC_CONSTQP) {
+        int qp = setup->qp >= 0 ? setup->qp : 26;
+        if (qp > 51 && !guidEqual(&pInfo->codecGuid, &NV_ENC_CODEC_AV1_GUID)) {
+            qp = 51;
+        }
+        rc->constQP.qpInterP = qp;
+        rc->constQP.qpInterB = qp;
+        rc->constQP.qpIntra = qp;
+    } else if (setup->bitRate) {
+        //VA semantics: bits_per_second is the peak, target_percentage the
+        //share of it to aim for on average (VBR only).
+        uint32_t target = setup->bitRate;
+        if (rcMode == NV_ENC_PARAMS_RC_VBR && setup->targetPct > 0 && setup->targetPct < 100) {
+            target = (uint32_t) ((uint64_t) setup->bitRate * setup->targetPct / 100);
+        }
+        rc->averageBitRate = target;
+        rc->maxBitRate = setup->bitRate;
+        rc->vbvBufferSize = setup->vbvSize;
+        rc->vbvInitialDelay = setup->vbvInit;
+    } else {
+        //No bitrate given: constant-quality VBR.
+        rc->averageBitRate = 0;
+        rc->maxBitRate = 0;
+        rc->targetQuality = 24;
+    }
+
+    //Client QP bounds. AV1 uses a different QP scale, so leave it alone there.
+    rc->enableMinQP = 0;
+    rc->enableMaxQP = 0;
+    if (rcMode != NV_ENC_PARAMS_RC_CONSTQP && !guidEqual(&pInfo->codecGuid, &NV_ENC_CODEC_AV1_GUID)) {
+        if (setup->minQp > 0 && setup->minQp <= 51) {
+            rc->enableMinQP = 1;
+            rc->minQP.qpInterP = rc->minQP.qpInterB = rc->minQP.qpIntra = setup->minQp;
+        }
+        if (setup->maxQp > 0 && setup->maxQp <= 51 && setup->maxQp >= setup->minQp) {
+            rc->enableMaxQP = 1;
+            rc->maxQP.qpInterP = rc->maxQP.qpInterB = rc->maxQP.qpIntra = setup->maxQp;
+        }
+    }
+
+    if (guidEqual(&pInfo->codecGuid, &NV_ENC_CODEC_H264_GUID)) {
+        NV_ENC_CONFIG_H264 *h264 = &cfg->encodeCodecConfig.h264Config;
+        h264->idrPeriod = setup->gopSize;
+        h264->repeatSPSPPS = 1;
+        h264->level = NV_ENC_LEVEL_AUTOSELECT;
+        h264->chromaFormatIDC = 1;
+    } else if (guidEqual(&pInfo->codecGuid, &NV_ENC_CODEC_HEVC_GUID)) {
+        NV_ENC_CONFIG_HEVC *hevc = &cfg->encodeCodecConfig.hevcConfig;
+        hevc->idrPeriod = setup->gopSize;
+        hevc->repeatSPSPPS = 1;
+        hevc->level = NV_ENC_LEVEL_AUTOSELECT;
+        hevc->chromaFormatIDC = 1;
+        hevc->inputBitDepth = hevc->outputBitDepth = is10Bit ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+    } else {
+        NV_ENC_CONFIG_AV1 *av1 = &cfg->encodeCodecConfig.av1Config;
+        av1->idrPeriod = setup->gopSize;
+        av1->repeatSeqHdr = 1;
+        //VA-API coded buffers carry low-overhead OBUs, not Annex B.
+        av1->outputAnnexBFormat = 0;
+        av1->level = NV_ENC_LEVEL_AUTOSELECT;
+        av1->chromaFormatIDC = 1;
+        av1->inputBitDepth = av1->outputBitDepth = is10Bit ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+    }
+
+    NV_ENC_INITIALIZE_PARAMS *init = &enc->initParams;
+    memset(init, 0, sizeof(*init));
+    init->version = NV_ENC_INITIALIZE_PARAMS_VER;
+    init->encodeGUID = pInfo->codecGuid;
+    init->presetGUID = *preset;
+    init->tuningInfo = tuning;
+    init->encodeWidth = setup->width;
+    init->encodeHeight = setup->height;
+    init->darWidth = setup->width;
+    init->darHeight = setup->height;
+    init->frameRateNum = setup->fpsNum ? setup->fpsNum : 30;
+    init->frameRateDen = setup->fpsDen ? setup->fpsDen : 1;
+    init->enablePTD = 1;
+    init->enableEncodeAsync = 0;
+    init->encodeConfig = cfg;
+}
+
+//Apply rate control changes without tearing down the session, so a
+//bandwidth-estimation driven bitrate change doesn't force a new IDR.
+static bool encoderReconfigure(NVEncoder *enc, const EncSetup *setup) {
+    EncodeProfileInfo pInfo;
+    if (!encodeProfileInfo(enc->ctx->profile, &pInfo)) {
+        return false;
+    }
+    encoderBuildParams(enc, setup, &pInfo);
+
+    NV_ENC_RECONFIGURE_PARAMS params = {0};
+    params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    params.reInitEncodeParams = enc->initParams;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
+    NVENCSTATUS status = enc->lib->api.nvEncReconfigureEncoder(enc->session, &params);
+    if (status != NV_ENC_SUCCESS) {
+        nvEncodeLogError(enc->lib, enc->session, status, "NvEncReconfigureEncoder");
+        return false;
+    }
+    LOG_DEBUG("NVENC reconfigured: bitrate %u (target %u%%), %u/%u fps",
+              setup->bitRate, setup->targetPct, setup->fpsNum, setup->fpsDen);
+    enc->current = *setup;
+    return true;
 }
 
 //Create the NVENC encoder for the parsed setup. Assumes the CUDA context is
@@ -865,7 +1055,7 @@ static bool encoderInitialise(NVEncoder *enc, const EncSetup *setup) {
     if (!encodeProfileInfo(enc->ctx->profile, &pInfo)) {
         return false;
     }
-    NV_ENC_BUFFER_FORMAT format = setup->format;
+    const NV_ENC_BUFFER_FORMAT format = setup->format;
 
     if (setup->width == 0 || setup->height == 0) {
         LOG("Encode picture has zero dimensions");
@@ -886,79 +1076,9 @@ static bool encoderInitialise(NVEncoder *enc, const EncSetup *setup) {
         }
     }
 
-    memset(&enc->encodeConfig, 0, sizeof(enc->encodeConfig));
-    NV_ENC_CONFIG *cfg = &enc->encodeConfig;
-    cfg->version = NV_ENC_CONFIG_VER;
-    cfg->profileGUID = pInfo.profileGuid;
-    cfg->gopLength = setup->gopSize;
-    //Basic path: no B-frames, so output order matches input order and there
-    //is never a reordering delay to flush.
-    cfg->frameIntervalP = 1;
+    encoderBuildParams(enc, setup, &pInfo);
 
-    cfg->rcParams.version = NV_ENC_RC_PARAMS_VER;
-    cfg->rcParams.rateControlMode = nvencRcMode(setup->rcMode);
-    if (setup->bitRate) {
-        cfg->rcParams.averageBitRate = setup->bitRate;
-        cfg->rcParams.maxBitRate = (setup->rcMode & VA_RC_VBR) ? setup->bitRate * 2 : setup->bitRate;
-    } else {
-        //No bitrate given (e.g. quality-driven CQP-less default): VBR with a
-        //constant-ish quality target keeps NVENC happy.
-        cfg->rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-        cfg->rcParams.targetQuality = 24;
-    }
-    if (cfg->rcParams.rateControlMode == NV_ENC_PARAMS_RC_CONSTQP) {
-        int qp = setup->qp >= 0 ? setup->qp : 26;
-        if (qp > 51) {
-            qp = 51;
-        }
-        cfg->rcParams.constQP.qpInterP = qp;
-        cfg->rcParams.constQP.qpInterB = qp;
-        cfg->rcParams.constQP.qpIntra = qp;
-    }
-
-    NV_ENC_INITIALIZE_PARAMS initParams = {0};
-    initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    initParams.encodeGUID = pInfo.codecGuid;
-    initParams.presetGUID = *presetForQuality(setup->quality);
-    initParams.encodeWidth = setup->width;
-    initParams.encodeHeight = setup->height;
-    initParams.darWidth = setup->width;
-    initParams.darHeight = setup->height;
-    initParams.frameRateNum = setup->fpsNum ? setup->fpsNum : 30;
-    initParams.frameRateDen = setup->fpsDen ? setup->fpsDen : 1;
-    initParams.enablePTD = 1;
-    initParams.enableEncodeAsync = 0;
-    initParams.tuningInfo = NV_ENC_TUNING_INFO_HIGH_QUALITY;
-    initParams.encodeConfig = cfg;
-
-    //Codec-specific config.
-    if (memcmp(&pInfo.codecGuid, &NV_ENC_CODEC_H264_GUID, sizeof(GUID)) == 0) {
-        cfg->encodeCodecConfig.h264Config.idrPeriod = setup->gopSize;
-        cfg->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-        cfg->encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_AUTOSELECT;
-        cfg->encodeCodecConfig.h264Config.chromaFormatIDC = 1;
-    } else if (memcmp(&pInfo.codecGuid, &NV_ENC_CODEC_HEVC_GUID, sizeof(GUID)) == 0) {
-        cfg->encodeCodecConfig.hevcConfig.idrPeriod = setup->gopSize;
-        cfg->encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
-        cfg->encodeCodecConfig.hevcConfig.level = NV_ENC_LEVEL_AUTOSELECT;
-        cfg->encodeCodecConfig.hevcConfig.chromaFormatIDC = 1;
-        cfg->encodeCodecConfig.hevcConfig.minCUSize = NV_ENC_HEVC_CUSIZE_AUTOSELECT;
-        cfg->encodeCodecConfig.hevcConfig.maxCUSize = NV_ENC_HEVC_CUSIZE_AUTOSELECT;
-        cfg->encodeCodecConfig.hevcConfig.inputBitDepth = cfg->encodeCodecConfig.hevcConfig.outputBitDepth =
-            format == NV_ENC_BUFFER_FORMAT_YUV420_10BIT ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
-    } else {
-        cfg->encodeCodecConfig.av1Config.idrPeriod = setup->gopSize;
-        cfg->encodeCodecConfig.av1Config.repeatSeqHdr = 1;
-        cfg->encodeCodecConfig.av1Config.outputAnnexBFormat = 1;
-        cfg->encodeCodecConfig.av1Config.level = NV_ENC_LEVEL_AUTOSELECT;
-        cfg->encodeCodecConfig.av1Config.chromaFormatIDC = 1;
-        cfg->encodeCodecConfig.av1Config.minPartSize = NV_ENC_AV1_PART_SIZE_AUTOSELECT;
-        cfg->encodeCodecConfig.av1Config.maxPartSize = NV_ENC_AV1_PART_SIZE_AUTOSELECT;
-        cfg->encodeCodecConfig.av1Config.inputBitDepth = cfg->encodeCodecConfig.av1Config.outputBitDepth =
-            format == NV_ENC_BUFFER_FORMAT_YUV420_10BIT ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
-    }
-
-    NVENCSTATUS status = api->nvEncInitializeEncoder(enc->session, &initParams);
+    NVENCSTATUS status = api->nvEncInitializeEncoder(enc->session, &enc->initParams);
     if (status != NV_ENC_SUCCESS) {
         nvEncodeLogError(lib, enc->session, status, "NvEncInitializeEncoder");
         goto fail;
@@ -977,33 +1097,36 @@ static bool encoderInitialise(NVEncoder *enc, const EncSetup *setup) {
     }
     enc->bitstreamBuffer = bsBuf.bitstreamBuffer;
 
-    //Input: NVENC-owned buffer. Registering a client pitched device pointer
-    //made NVENC mis-derive the NV12 plane geometry (output came out vertically
-    //squashed), so let NVENC allocate it, as FFmpeg's nvenc does.
+    //Input: luma rows followed directly by the chroma rows in one pitched
+    //allocation. NVENC derives the chroma plane as pitch * registered height,
+    //so the registration height must be exactly the luma row count.
     const uint32_t bpp = format == NV_ENC_BUFFER_FORMAT_YUV420_10BIT ? 2 : 1;
-    const uint32_t alignedHeight = (setup->height + 1u) & ~1u;
-    NV_ENC_CREATE_INPUT_BUFFER inBuf = {0};
-    inBuf.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-    inBuf.width = setup->width;
-    inBuf.height = setup->height;
-    inBuf.bufferFmt = format;
-    status = api->nvEncCreateInputBuffer(enc->session, &inBuf);
+    const uint32_t widthBytes = ((setup->width + 1u) & ~1u) * bpp;
+    const uint32_t rows = setup->height + (setup->height + 1u) / 2;
+    if (CHECK_CUDA_RESULT(cu->cuMemAllocPitch(&enc->inputDev, &enc->inputPitch, widthBytes, rows, 16))) {
+        enc->inputDev = 0;
+        goto fail;
+    }
+
+    NV_ENC_REGISTER_RESOURCE reg = {0};
+    reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+    reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+    reg.width = setup->width;
+    reg.height = setup->height;
+    reg.pitch = (uint32_t) enc->inputPitch;
+    reg.resourceToRegister = (void *) (uintptr_t) enc->inputDev;
+    reg.bufferFormat = format;
+    reg.bufferUsage = NV_ENC_INPUT_IMAGE;
+    status = api->nvEncRegisterResource(enc->session, &reg);
     if (status != NV_ENC_SUCCESS) {
-        nvEncodeLogError(lib, enc->session, status, "NvEncCreateInputBuffer");
+        nvEncodeLogError(lib, enc->session, status, "NvEncRegisterResource");
         goto fail;
     }
-    enc->inputBuffer = inBuf.inputBuffer;
+    enc->inputReg = reg.registeredResource;
 
-    //Host staging buffer sized for the tightest packed layout (bpp*W rows).
-    enc->hostStageSize = (size_t) setup->width * bpp * alignedHeight * 3 / 2;
-    enc->hostStage = malloc(enc->hostStageSize);
-    if (!enc->hostStage) {
-        LOG("Unable to allocate encode host staging buffer");
-        goto fail;
-    }
-
-    LOG("NVENC encoder ready: profile %d, %ux%u, format %d, gop %u, bitrate %u",
-        (int) enc->ctx->profile, setup->width, setup->height, (int) format, setup->gopSize, setup->bitRate);
+    LOG("NVENC encoder ready: profile %d, %ux%u, format %d, gop %u, rc %d, bitrate %u, %u/%u fps",
+        (int) enc->ctx->profile, setup->width, setup->height, (int) format, setup->gopSize,
+        (int) enc->encodeConfig.rcParams.rateControlMode, setup->bitRate, setup->fpsNum, setup->fpsDen);
     enc->haveCurrent = true;
     enc->current = *setup;
     return true;
@@ -1013,8 +1136,7 @@ fail:
     return false;
 }
 
-//Copy the target surface's planes into the host staging buffer (packed NV12/
-//P010 layout: luma rows of width*bpp bytes, then chroma rows).
+//Copy the target surface's planes into the registered NVENC input buffer.
 static bool encoderUploadSurface(NVEncoder *enc, BackingImage *img, uint32_t width, uint32_t height) {
     if (!img->arrays[0] || !img->arrays[1]) {
         LOG("Encode target surface backing image has no CUDA arrays");
@@ -1032,74 +1154,31 @@ static bool encoderUploadSurface(NVEncoder *enc, BackingImage *img, uint32_t wid
     }
 
     CudaFunctions *cu = enc->drv->cu;
-    const uint32_t stagePitch = width * bpp;
     CUDA_MEMCPY2D yCpy = {
         .srcMemoryType = CU_MEMORYTYPE_ARRAY,
         .srcArray = img->arrays[0],
-        .dstMemoryType = CU_MEMORYTYPE_HOST,
-        .dstHost = enc->hostStage,
-        .dstPitch = stagePitch,
-        .WidthInBytes = stagePitch,
+        .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+        .dstDevice = enc->inputDev,
+        .dstPitch = enc->inputPitch,
+        .WidthInBytes = width * bpp,
         .Height = height,
     };
     CUDA_MEMCPY2D uvCpy = {
         .srcMemoryType = CU_MEMORYTYPE_ARRAY,
         .srcArray = img->arrays[1],
-        .dstMemoryType = CU_MEMORYTYPE_HOST,
-        .dstHost = enc->hostStage + (size_t) stagePitch * height,
-        .dstPitch = ((width + 1u) & ~1u) * bpp,
+        .dstMemoryType = CU_MEMORYTYPE_DEVICE,
+        .dstDevice = enc->inputDev + enc->inputPitch * enc->encHeight,
+        .dstPitch = enc->inputPitch,
         .WidthInBytes = ((width + 1u) & ~1u) * bpp,
         .Height = (height + 1u) / 2,
     };
 
+    //NVENC works on its own stream, so make sure the copies have landed.
     if (CHECK_CUDA_RESULT(cu->cuMemcpy2DAsync(&yCpy, 0)) ||
         CHECK_CUDA_RESULT(cu->cuMemcpy2DAsync(&uvCpy, 0)) ||
         CHECK_CUDA_RESULT(cu->cuStreamSynchronize(0))) {
         return false;
     }
-
-    if (getenv("NVD_DUMP_INPUT")) {
-        static FILE *dump = NULL;
-        if (!dump) dump = fopen("/tmp/encode_input.nv12", "wb");
-        if (dump) {
-            fwrite(enc->hostStage, 1, (size_t) stagePitch * height * 3 / 2, dump);
-            fflush(dump);
-        }
-    }
-    return true;
-}
-
-//Copy the staged frame into NVENC's locked input buffer, honouring the pitch
-//NVENC reports for each plane.
-static bool encoderFillInputBuffer(NVEncoder *enc, uint32_t width, uint32_t height) {
-    NV_ENCODE_API_FUNCTION_LIST *api = &enc->lib->api;
-    const bool is16Bit = enc->bufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
-    const uint32_t bpp = is16Bit ? 2 : 1;
-    const uint32_t stagePitch = width * bpp;
-
-    NV_ENC_LOCK_INPUT_BUFFER lock = {0};
-    lock.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-    lock.inputBuffer = enc->inputBuffer;
-    NVENCSTATUS status = api->nvEncLockInputBuffer(enc->session, &lock);
-    if (status != NV_ENC_SUCCESS) {
-        nvEncodeLogError(enc->lib, enc->session, status, "NvEncLockInputBuffer");
-        return false;
-    }
-
-    unsigned char *dst = lock.bufferDataPtr;
-    const uint32_t dstPitch = lock.pitch;
-    const unsigned char *src = enc->hostStage;
-    for (uint32_t y = 0; y < height; y++) {
-        memcpy(dst + (size_t) y * dstPitch, src + (size_t) y * stagePitch, stagePitch);
-    }
-    const uint32_t chromaW = ((width + 1u) & ~1u) * bpp;
-    const unsigned char *srcUV = src + (size_t) stagePitch * height;
-    unsigned char *dstUV = dst + (size_t) dstPitch * height;
-    for (uint32_t y = 0; y < (height + 1u) / 2; y++) {
-        memcpy(dstUV + (size_t) y * dstPitch, srcUV + (size_t) y * chromaW, chromaW);
-    }
-
-    api->nvEncUnlockInputBuffer(enc->session, enc->inputBuffer);
     return true;
 }
 
@@ -1172,7 +1251,11 @@ static VAStatus encoderEncodePicture(NVEncoder *enc, PictureParse *pp, VABufferI
     }
 
     const EncSetup *setup = &pp->setup;
-    if (!enc->encoderReady || !enc->haveCurrent || setupChanged(&enc->current, setup)) {
+    bool needInit = !enc->encoderReady || !enc->haveCurrent || setupNeedsReset(&enc->current, setup);
+    if (!needInit && setupNeedsReconfigure(&enc->current, setup) && !encoderReconfigure(enc, setup)) {
+        needInit = true;
+    }
+    if (needInit) {
         if (enc->encoderReady) {
             LOG("Encoder settings changed, re-initialising");
             encoderReset(enc);
@@ -1189,7 +1272,12 @@ static VAStatus encoderEncodePicture(NVEncoder *enc, PictureParse *pp, VABufferI
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    if (!encoderFillInputBuffer(enc, setup->width, setup->height)) {
+    NV_ENC_MAP_INPUT_RESOURCE map = {0};
+    map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    map.registeredResource = enc->inputReg;
+    NVENCSTATUS status = api->nvEncMapInputResource(enc->session, &map);
+    if (status != NV_ENC_SUCCESS) {
+        nvEncodeLogError(lib, enc->session, status, "NvEncMapInputResource");
         return ret;
     }
 
@@ -1197,11 +1285,10 @@ static VAStatus encoderEncodePicture(NVEncoder *enc, PictureParse *pp, VABufferI
     picParams.version = NV_ENC_PIC_PARAMS_VER;
     picParams.inputWidth = setup->width;
     picParams.inputHeight = setup->height;
-    //Pitch is implicit for an NVENC-owned input buffer.
-    picParams.inputPitch = 0;
-    picParams.inputBuffer = enc->inputBuffer;
+    picParams.inputPitch = (uint32_t) enc->inputPitch;
+    picParams.inputBuffer = map.mappedResource;
     picParams.outputBitstream = enc->bitstreamBuffer;
-    picParams.bufferFmt = enc->bufferFormat;
+    picParams.bufferFmt = map.mappedBufferFmt;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
     picParams.frameIdx = enc->frameCount;
     picParams.inputTimeStamp = enc->frameCount;
@@ -1209,7 +1296,7 @@ static VAStatus encoderEncodePicture(NVEncoder *enc, PictureParse *pp, VABufferI
         picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
     }
 
-    NVENCSTATUS status = api->nvEncEncodePicture(enc->session, &picParams);
+    status = api->nvEncEncodePicture(enc->session, &picParams);
     if (status != NV_ENC_SUCCESS) {
         nvEncodeLogError(lib, enc->session, status, "NvEncEncodePicture");
         goto cleanup;
@@ -1254,6 +1341,7 @@ cleanup:
     if (bsLocked) {
         api->nvEncUnlockBitstream(enc->session, enc->bitstreamBuffer);
     }
+    api->nvEncUnmapInputResource(enc->session, map.mappedResource);
     return ret;
 }
 
